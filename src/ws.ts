@@ -3,11 +3,10 @@ import { createClient as deepgramCreateClient } from "@deepgram/sdk";
 import { LiveTranscriptionEvents } from "@deepgram/sdk";
 import { ChatCompletionRequestMessage } from "./lib/types";
 import { streamLLMResponse } from "./lib/llm";
-import { CartesiaClient } from "@cartesia/cartesia-js";
 
 type ClientInfo = {
   deepgram_live: any;
-  cartesia_ws: any;
+  cartesia_ws: WebSocket;
   cartesia_context_id: string;
   start_timestamp: number;
   messages: ChatCompletionRequestMessage[];
@@ -23,6 +22,7 @@ const WebsocketConnection = async (websock: WebSocket.Server) => {
       const client = clients.get(ws);
       if (client) {
         client.deepgram_live.requestClose();
+        client.cartesia_ws.close();
         const startTimestamp: any = client.start_timestamp;
         const duration = new Date().getTime() - startTimestamp;
         console.log(`Session lasted for: ${duration} milliseconds`);
@@ -84,24 +84,21 @@ const WebsocketConnection = async (websock: WebSocket.Server) => {
       utterance_end_ms: 1000,
     });
 
-    // Initialize Cartesia TTS
-    const cartesia = new CartesiaClient({
-      apiKey: process.env.CARTESIA_API_KEY,
+    // Initialize direct connection to Cartesia TTS websocket
+    // Using query parameters for API key as WebSocket connections don't support custom headers in all environments
+    const cartesiaWs = new WebSocket(
+      `wss://api.cartesia.ai/tts/websocket?api_key=${process.env.CARTESIA_API_KEY}&cartesia_version=2024-06-10`,
+    );
+
+    // Setup Cartesia websocket event handlers
+    cartesiaWs.on("open", () => {
+      console.log("✅ Connected to Cartesia TTS websocket");
+      // No initial configuration message needed - configuration is sent with each request
     });
 
-    const cartesiaWs = cartesia.tts.websocket({
-      container: "raw",
-      sampleRate: 44100,
-      encoding: "pcm_s16le",
-    });
-
-    try {
-      await cartesiaWs.connect();
-      console.log("✅ Connected to Cartesia TTS");
-    } catch (error) {
+    cartesiaWs.on("error", (error) => {
       console.error(`❌ Failed to connect to Cartesia: ${error}`);
-      throw error;
-    }
+    });
 
     let keepAliveInterval: NodeJS.Timeout;
 
@@ -120,6 +117,57 @@ const WebsocketConnection = async (websock: WebSocket.Server) => {
       cartesia_context_id: contextId,
       start_timestamp: new Date().getTime(),
       messages: [], // Initialize the messages array
+    });
+
+    // Setup cartesia message handler
+    cartesiaWs.on("message", (message: any) => {
+      try {
+        const parsedMsg = JSON.parse(message.toString());
+
+        // Handle different response types from Cartesia
+        switch (parsedMsg.type) {
+          case "chunk":
+            if (parsedMsg.data) {
+              send(ws, "tts_audio", {
+                audio: parsedMsg.data,
+                done: parsedMsg.done,
+                context_id: parsedMsg.context_id,
+              });
+            }
+            break;
+
+          case "timestamps":
+            // Optionally process word timestamps
+            console.log("Received word timestamps:", parsedMsg.word_timestamps);
+            break;
+
+          case "done":
+            console.log(
+              "TTS generation complete for context:",
+              parsedMsg.context_id,
+            );
+            send(ws, "tts_complete", {
+              context_id: parsedMsg.context_id,
+            });
+            break;
+
+          case "error":
+            console.error("TTS error:", parsedMsg.error);
+            send(ws, "tts_error", {
+              error: parsedMsg.error,
+              context_id: parsedMsg.context_id,
+            });
+            break;
+
+          default:
+            console.log(
+              "Unhandled message type from Cartesia:",
+              parsedMsg.type,
+            );
+        }
+      } catch (error) {
+        console.error("Error parsing Cartesia message:", error);
+      }
     });
 
     // setup deepgram event listeners
@@ -202,14 +250,14 @@ const WebsocketConnection = async (websock: WebSocket.Server) => {
       const clientData = clients.get(ws);
       if (clientData && clientData.cartesia_ws) {
         try {
-          clientData.cartesia_ws.disconnect();
+          clientData.cartesia_ws.close();
           console.log("Cartesia TTS connection closed");
         } catch (error) {
           console.error("Error closing Cartesia connection:", error);
         }
       }
 
-      if (ws.OPEN) {
+      if (ws.readyState === WebSocket.OPEN) {
         ws.close();
       }
     });
@@ -226,6 +274,15 @@ const WebsocketConnection = async (websock: WebSocket.Server) => {
         );
         clientData.cancelCurrentGeneration();
         clientData.cancelCurrentGeneration = undefined;
+
+        // cancelling cartesia tts
+        if (clientData.cartesia_ws.readyState === WebSocket.OPEN) {
+          const cancelMessage = JSON.stringify({
+            context_id: clientData.cartesia_context_id,
+            cancel: true,
+          });
+          clientData.cartesia_ws.send(cancelMessage);
+        }
       }
     };
 
@@ -272,8 +329,6 @@ const WebsocketConnection = async (websock: WebSocket.Server) => {
 
         let responseText = "";
 
-        let cartesiaResponse: any = null;
-
         // Stream LLM response
         const cancelGeneration = await streamLLMResponse({
           messages: clientData.messages,
@@ -300,42 +355,36 @@ const WebsocketConnection = async (websock: WebSocket.Server) => {
             // Send completion event
             send(ws, "llm_complete", { fullText });
 
-            cartesiaResponse = await clientData.cartesia_ws.send({
-              modelId: "sonic-2",
-              voice: {
-                mode: "id",
-                id: "a0e99841-438c-4a64-b679-ae501e7d6091",
-              },
-              transcript: fullText,
-            });
-
-            cartesiaResponse.on("message", (message: any) => {
-              // Raw message.
-              // console.log("Received message:", message);
-              const parsedMsg = JSON.parse(message);
-              send(ws, "tts_audio", {
-                audio: parsedMsg["data"],
+            // Send TTS request to Cartesia
+            if (clientData.cartesia_ws.readyState === WebSocket.OPEN) {
+              const ttsRequest = JSON.stringify({
+                model_id: "sonic-2",
+                transcript: fullText,
+                voice: {
+                  mode: "id",
+                  id: "a0e99841-438c-4a64-b679-ae501e7d6091",
+                },
+                language: "en",
+                context_id: clientData.cartesia_context_id,
+                output_format: {
+                  container: "raw",
+                  encoding: "pcm_s16le",
+                  sample_rate: 44100,
+                },
+                add_timestamps: true,
+                continue: false,
               });
-            });
 
-            // for await (const message of cartesiaResponse.events("message")) {
-            //   try {
-            //     const parsedMsg = JSON.parse(message);
-            //     console.log(parsedMsg);
-
-            //     send(ws, "tts_audio", {
-            //       audio: parsedMsg["data"],
-            //     });
-            //   } catch (error) {
-            //     console.error("Error processing TTS message:", error);
-            //   }
-            // }
-
-            // Handle errors
-            cartesiaResponse.on("error", (error: any) => {
-              console.error("TTS error:", error);
-              send(ws, "tts_error", { error: String(error) });
-            });
+              console.log("Sending TTS request to Cartesia:", ttsRequest);
+              clientData.cartesia_ws.send(ttsRequest);
+            } else {
+              console.error(
+                "Cartesia WebSocket not open, cannot send TTS request",
+              );
+              send(ws, "tts_error", {
+                error: "Cartesia WebSocket connection not available",
+              });
+            }
           },
           onError: (error) => {
             console.error("❌ [ERROR] LLM generation error:", error);
