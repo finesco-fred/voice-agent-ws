@@ -7,7 +7,7 @@ import { streamLLMResponse } from "./lib/llm";
 type ClientInfo = {
   deepgram_live: any;
   cartesia_ws: WebSocket;
-  cartesia_context_id: string;
+  cartesia_context_id: string | null;
   start_timestamp: number;
   messages: ChatCompletionRequestMessage[];
   cancelCurrentGeneration?: () => void;
@@ -80,7 +80,7 @@ const WebsocketConnection = async (websock: WebSocket.Server) => {
       sample_rate: 44100,
       channels: 1,
       interim_results: true,
-      endpointing: 200,
+      endpointing: 300,
       utterance_end_ms: 1000,
     });
 
@@ -116,7 +116,13 @@ const WebsocketConnection = async (websock: WebSocket.Server) => {
       cartesia_ws: cartesiaWs,
       cartesia_context_id: contextId,
       start_timestamp: new Date().getTime(),
-      messages: [], // Initialize the messages array
+      messages: [
+        {
+          role: "assistant",
+          content:
+            "Hello! I'm the Finesco interviewer. I'd like to understand your professional background and expertise. Could you tell me about your industry experience?",
+        },
+      ], // Initialize the messages array
     });
 
     // Setup cartesia message handler
@@ -127,18 +133,17 @@ const WebsocketConnection = async (websock: WebSocket.Server) => {
         // Handle different response types from Cartesia
         switch (parsedMsg.type) {
           case "chunk":
-            if (parsedMsg.data) {
+            if (parsedMsg.data && clients.get(ws)?.cartesia_context_id) {
               send(ws, "tts_audio", {
                 audio: parsedMsg.data,
                 done: parsedMsg.done,
                 context_id: parsedMsg.context_id,
               });
+              console.log(parsedMsg.context_id);
             }
             break;
 
           case "timestamps":
-            // Optionally process word timestamps
-            console.log("Received word timestamps:", parsedMsg.word_timestamps);
             break;
 
           case "done":
@@ -175,6 +180,28 @@ const WebsocketConnection = async (websock: WebSocket.Server) => {
       console.log("Deepgram connection opened");
       send(ws, "initialized", {});
 
+      const ttsRequest = JSON.stringify({
+        model_id: "sonic-2",
+        transcript:
+          "Hello! I'm the Finesco interviewer. I'd like to understand your professional background and expertise. Could you tell me about your industry experience?",
+        voice: {
+          mode: "id",
+          id: "a0e99841-438c-4a64-b679-ae501e7d6091",
+        },
+        language: "en",
+        context_id: contextId,
+        output_format: {
+          container: "raw",
+          encoding: "pcm_s16le",
+          sample_rate: 44100,
+        },
+        add_timestamps: true,
+        continue: true,
+      });
+
+      console.log("Sending TTS request to Cartesia");
+      cartesiaWs.send(ttsRequest);
+
       live.keepAlive();
       keepAliveInterval = setInterval(() => {
         live.keepAlive();
@@ -192,7 +219,6 @@ const WebsocketConnection = async (websock: WebSocket.Server) => {
           if (!isSpeaking) {
             isSpeaking = true;
             console.log("🎙️ [START] User started speaking");
-            send(ws, "speech_start", { timestamp: new Date().getTime() });
 
             // Cancel any ongoing LLM generation and TTS playback
             handleUserInterruption(ws);
@@ -264,8 +290,16 @@ const WebsocketConnection = async (websock: WebSocket.Server) => {
 
     // Function to handle user interruption
     const handleUserInterruption = (ws: WebSocket) => {
+      send(ws, "speech_start", {
+        timestamp: new Date().getTime(),
+        pending_dialog_id: clients.get(ws)?.cartesia_context_id,
+      });
+
       const clientData = clients.get(ws);
       if (!clientData) return;
+
+      clientData.cartesia_context_id = null;
+      console.log(clientData.cartesia_context_id);
 
       // Cancel LLM generation if in progress
       if (clientData.cancelCurrentGeneration) {
@@ -282,6 +316,7 @@ const WebsocketConnection = async (websock: WebSocket.Server) => {
             cancel: true,
           });
           clientData.cartesia_ws.send(cancelMessage);
+          clientData.cartesia_context_id = null;
         }
       }
     };
@@ -331,63 +366,103 @@ const WebsocketConnection = async (websock: WebSocket.Server) => {
 
         // streaming tts config
         let newContextId: null | string = null;
+        // Buffer to hold tokens until a complete sentence (ending with period) is formed
+        let tokensBuffer = "";
 
         // Stream LLM response
         const cancelGeneration = await streamLLMResponse({
           messages: clientData.messages,
           onToken: async (token) => {
-            // Send token to client
-            send(ws, "llm_token", { token });
-
             responseText += token;
             console.log(`🤖 [STREAMING] LLM generating: "${responseText}"`);
 
-            if (clientData.cartesia_ws.readyState === WebSocket.OPEN) {
-              if (newContextId) {
-                const ttsRequest = JSON.stringify({
-                  model_id: "sonic-2",
-                  transcript: token,
-                  voice: {
-                    mode: "id",
-                    id: "a0e99841-438c-4a64-b679-ae501e7d6091",
-                  },
-                  language: "en",
-                  context_id: newContextId,
-                  output_format: {
-                    container: "raw",
-                    encoding: "pcm_s16le",
-                    sample_rate: 44100,
-                  },
-                  add_timestamps: true,
-                  continue: true,
-                });
+            // Add token to the buffer
+            tokensBuffer += token;
+            console.log("Tokens buffer...", tokensBuffer);
 
-                console.log("Sending TTS request to Cartesia");
-                clientData.cartesia_ws.send(ttsRequest);
+            // Check if the buffer contains a period or question mark (end of sentence)
+            const hasPeriod = tokensBuffer.includes(".");
+            const hasQuestionMark = tokensBuffer.includes("?");
+
+            if (hasPeriod || hasQuestionMark) {
+              let completeSentence;
+              let remainingText;
+
+              // Find the index of the first occurrence of each sentence terminator
+              const periodIndex = hasPeriod
+                ? tokensBuffer.indexOf(".")
+                : Infinity;
+              const questionIndex = hasQuestionMark
+                ? tokensBuffer.indexOf("?")
+                : Infinity;
+
+              // Determine which terminator comes first
+              if (periodIndex < questionIndex) {
+                // Period comes first
+                const parts = tokensBuffer.split(".", 2);
+                completeSentence = parts[0] + "."; // Include the period
+                remainingText = parts.length > 1 ? parts[1] : "";
               } else {
-                newContextId = new Date().getTime().toString();
-                const ttsRequest = JSON.stringify({
-                  model_id: "sonic-2",
-                  transcript: token,
-                  voice: {
-                    mode: "id",
-                    id: "a0e99841-438c-4a64-b679-ae501e7d6091",
-                  },
-                  language: "en",
-                  context_id: newContextId,
-                  output_format: {
-                    container: "raw",
-                    encoding: "pcm_s16le",
-                    sample_rate: 44100,
-                  },
-                  add_timestamps: true,
-                  continue: false,
-                });
-
-                console.log("Sending TTS request to Cartesia");
-                clientData.cartesia_ws.send(ttsRequest);
-                clientData.cartesia_context_id = newContextId;
+                // Question mark comes first
+                const parts = tokensBuffer.split("?", 2);
+                completeSentence = parts[0] + "?"; // Include the question mark
+                remainingText = parts.length > 1 ? parts[1] : "";
               }
+
+              // Send the complete sentence for TTS processing
+              if (clientData.cartesia_ws.readyState === WebSocket.OPEN) {
+                if (newContextId) {
+                  const ttsRequest = JSON.stringify({
+                    model_id: "sonic-2",
+                    transcript: completeSentence,
+                    voice: {
+                      mode: "id",
+                      id: "a0e99841-438c-4a64-b679-ae501e7d6091",
+                    },
+                    language: "en",
+                    context_id: newContextId,
+                    output_format: {
+                      container: "raw",
+                      encoding: "pcm_s16le",
+                      sample_rate: 44100,
+                    },
+                    continue: true,
+                  });
+
+                  console.log(ttsRequest);
+
+                  console.log("Sending TTS request to Cartesia");
+                  clientData.cartesia_ws.send(ttsRequest);
+                } else {
+                  newContextId = new Date().getTime().toString();
+                  const ttsRequest = JSON.stringify({
+                    model_id: "sonic-2",
+                    transcript: completeSentence,
+                    voice: {
+                      mode: "id",
+                      id: "a0e99841-438c-4a64-b679-ae501e7d6091",
+                    },
+                    language: "en",
+                    context_id: newContextId,
+                    output_format: {
+                      container: "raw",
+                      encoding: "pcm_s16le",
+                      sample_rate: 44100,
+                    },
+                    add_timestamps: true,
+                    continue: true,
+                  });
+
+                  console.log(ttsRequest);
+
+                  console.log("Sending TTS request to Cartesia");
+                  clientData.cartesia_ws.send(ttsRequest);
+                  clientData.cartesia_context_id = newContextId;
+                }
+              }
+
+              // Update buffer to contain only text after the sentence terminator
+              tokensBuffer = remainingText;
             }
           },
           onComplete: async (fullText) => {
@@ -405,6 +480,30 @@ const WebsocketConnection = async (websock: WebSocket.Server) => {
 
             // Send completion event
             send(ws, "llm_complete", { fullText });
+
+            // If there's remaining text in the buffer, send it for TTS
+            if (tokensBuffer.trim().length > 0) {
+              const ttsRequest = JSON.stringify({
+                model_id: "sonic-2",
+                transcript: tokensBuffer,
+                voice: {
+                  mode: "id",
+                  id: "a0e99841-438c-4a64-b679-ae501e7d6091",
+                },
+                language: "en",
+                context_id: newContextId,
+                output_format: {
+                  container: "raw",
+                  encoding: "pcm_s16le",
+                  sample_rate: 44100,
+                },
+                add_timestamps: true,
+                continue: !!newContextId,
+              });
+
+              console.log("Sending TTS request to Cartesia");
+              clientData.cartesia_ws.send(ttsRequest);
+            }
           },
           onError: (error) => {
             console.error("❌ [ERROR] LLM generation error:", error);
