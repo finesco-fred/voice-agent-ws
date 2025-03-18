@@ -329,6 +329,9 @@ const WebsocketConnection = async (websock: WebSocket.Server) => {
 
         let responseText = "";
 
+        // streaming tts config
+        let newContextId: null | string = null;
+
         // Stream LLM response
         const cancelGeneration = await streamLLMResponse({
           messages: clientData.messages,
@@ -338,6 +341,54 @@ const WebsocketConnection = async (websock: WebSocket.Server) => {
 
             responseText += token;
             console.log(`🤖 [STREAMING] LLM generating: "${responseText}"`);
+
+            if (clientData.cartesia_ws.readyState === WebSocket.OPEN) {
+              if (newContextId) {
+                const ttsRequest = JSON.stringify({
+                  model_id: "sonic-2",
+                  transcript: token,
+                  voice: {
+                    mode: "id",
+                    id: "a0e99841-438c-4a64-b679-ae501e7d6091",
+                  },
+                  language: "en",
+                  context_id: newContextId,
+                  output_format: {
+                    container: "raw",
+                    encoding: "pcm_s16le",
+                    sample_rate: 44100,
+                  },
+                  add_timestamps: true,
+                  continue: true,
+                });
+
+                console.log("Sending TTS request to Cartesia");
+                clientData.cartesia_ws.send(ttsRequest);
+              } else {
+                newContextId = new Date().getTime().toString();
+                const ttsRequest = JSON.stringify({
+                  model_id: "sonic-2",
+                  transcript: token,
+                  voice: {
+                    mode: "id",
+                    id: "a0e99841-438c-4a64-b679-ae501e7d6091",
+                  },
+                  language: "en",
+                  context_id: newContextId,
+                  output_format: {
+                    container: "raw",
+                    encoding: "pcm_s16le",
+                    sample_rate: 44100,
+                  },
+                  add_timestamps: true,
+                  continue: false,
+                });
+
+                console.log("Sending TTS request to Cartesia");
+                clientData.cartesia_ws.send(ttsRequest);
+                clientData.cartesia_context_id = newContextId;
+              }
+            }
           },
           onComplete: async (fullText) => {
             console.log("🤖 [COMPLETE] LLM generation complete");
@@ -354,37 +405,6 @@ const WebsocketConnection = async (websock: WebSocket.Server) => {
 
             // Send completion event
             send(ws, "llm_complete", { fullText });
-
-            // Send TTS request to Cartesia
-            if (clientData.cartesia_ws.readyState === WebSocket.OPEN) {
-              const ttsRequest = JSON.stringify({
-                model_id: "sonic-2",
-                transcript: fullText,
-                voice: {
-                  mode: "id",
-                  id: "a0e99841-438c-4a64-b679-ae501e7d6091",
-                },
-                language: "en",
-                context_id: clientData.cartesia_context_id,
-                output_format: {
-                  container: "raw",
-                  encoding: "pcm_s16le",
-                  sample_rate: 44100,
-                },
-                add_timestamps: true,
-                continue: false,
-              });
-
-              console.log("Sending TTS request to Cartesia:", ttsRequest);
-              clientData.cartesia_ws.send(ttsRequest);
-            } else {
-              console.error(
-                "Cartesia WebSocket not open, cannot send TTS request",
-              );
-              send(ws, "tts_error", {
-                error: "Cartesia WebSocket connection not available",
-              });
-            }
           },
           onError: (error) => {
             console.error("❌ [ERROR] LLM generation error:", error);
