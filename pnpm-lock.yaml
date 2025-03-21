@@ -26,6 +26,9 @@ dependencies:
   typescript:
     specifier: ^5.8.2
     version: 5.8.2
+  wavefile:
+    specifier: ^11.0.0
+    version: 11.0.0
   ws:
     specifier: ^8.18.1
     version: 8.18.1
@@ -1059,6 +1062,12 @@ packages:
   /vary@1.1.2:
     resolution: {integrity: sha512-BNGbWLfd0eUPabhkXUVm0j8uuvREyTh5ovRa/dyow/BqAbZJyC+5fU+IzQOzmAKzYqYRAISoRhdQr3eIZ/PXqg==}
     engines: {node: '>= 0.8'}
+    dev: false
+
+  /wavefile@11.0.0:
+    resolution: {integrity: sha512-/OBiAALgWU24IG7sC84cDO/KfFuvajWc5Uec0oV2zrpOOZZDgGdOwHwgEzOrwh8jkubBk7PtZfQBIcI1OaE5Ng==}
+    engines: {node: '>=8'}
+    hasBin: true
     dev: false
 
   /webidl-conversions@3.0.1:

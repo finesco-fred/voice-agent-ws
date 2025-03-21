@@ -3,6 +3,7 @@ import { createClient as deepgramCreateClient } from "@deepgram/sdk";
 import { LiveTranscriptionEvents } from "@deepgram/sdk";
 import { ChatCompletionRequestMessage } from "./lib/types";
 import { streamLLMResponse } from "./lib/llm";
+import { convertPcmToWav } from "./lib/audio";
 
 type ClientInfo = {
   deepgram_live: any;
@@ -13,7 +14,7 @@ type ClientInfo = {
   cancelCurrentGeneration?: () => void;
 };
 
-const clients = new Map<WebSocket, ClientInfo>();
+const clients: any = new Map<WebSocket, ClientInfo>();
 
 const WebsocketConnection = async (websock: WebSocket.Server) => {
   websock.on("connection", (ws: WebSocket) => {
@@ -80,7 +81,7 @@ const WebsocketConnection = async (websock: WebSocket.Server) => {
       sample_rate: 44100,
       channels: 1,
       interim_results: true,
-      endpointing: 300,
+      endpointing: 150,
       utterance_end_ms: 1000,
     });
 
@@ -116,6 +117,7 @@ const WebsocketConnection = async (websock: WebSocket.Server) => {
       cartesia_ws: cartesiaWs,
       cartesia_context_id: contextId,
       start_timestamp: new Date().getTime(),
+      audio_chunks: [],
       messages: [
         {
           role: "assistant",
@@ -134,12 +136,15 @@ const WebsocketConnection = async (websock: WebSocket.Server) => {
         switch (parsedMsg.type) {
           case "chunk":
             if (parsedMsg.data && clients.get(ws)?.cartesia_context_id) {
+              const rawPcmData = Buffer.from(parsedMsg.data, "base64");
+              const wavAudioData = convertPcmToWav(rawPcmData, 44100);
+
               send(ws, "tts_audio", {
-                audio: parsedMsg.data,
+                format: "wav",
                 done: parsedMsg.done,
                 context_id: parsedMsg.context_id,
+                audio: wavAudioData,
               });
-              console.log(parsedMsg.context_id);
             }
             break;
 
@@ -180,27 +185,10 @@ const WebsocketConnection = async (websock: WebSocket.Server) => {
       console.log("Deepgram connection opened");
       send(ws, "initialized", {});
 
-      const ttsRequest = JSON.stringify({
-        model_id: "sonic-2",
-        transcript:
-          "Hello! I'm the Finesco interviewer. I'd like to understand your professional background and expertise. Could you tell me about your industry experience?",
-        voice: {
-          mode: "id",
-          id: "a0e99841-438c-4a64-b679-ae501e7d6091",
-        },
-        language: "en",
-        context_id: contextId,
-        output_format: {
-          container: "raw",
-          encoding: "pcm_s16le",
-          sample_rate: 44100,
-        },
-        add_timestamps: true,
-        continue: true,
-      });
-
-      console.log("Sending TTS request to Cartesia");
-      cartesiaWs.send(ttsRequest);
+      sendToCartesiaTTS(
+        ws,
+        "Hello! I'm the Finesco interviewer. I'd like to understand your professional background and expertise. Could you tell me about your industry experience?",
+      );
 
       live.keepAlive();
       keepAliveInterval = setInterval(() => {
@@ -292,7 +280,7 @@ const WebsocketConnection = async (websock: WebSocket.Server) => {
     const handleUserInterruption = (ws: WebSocket) => {
       send(ws, "speech_start", {
         timestamp: new Date().getTime(),
-        pending_dialog_id: clients.get(ws)?.cartesia_context_id,
+        context_id: clients.get(ws)?.cartesia_context_id,
       });
 
       const clientData = clients.get(ws);
@@ -374,11 +362,11 @@ const WebsocketConnection = async (websock: WebSocket.Server) => {
           messages: clientData.messages,
           onToken: async (token) => {
             responseText += token;
-            console.log(`🤖 [STREAMING] LLM generating: "${responseText}"`);
+            // console.log(`🤖 [STREAMING] LLM generating: "${responseText}"`);
 
             // Add token to the buffer
             tokensBuffer += token;
-            console.log("Tokens buffer...", tokensBuffer);
+            // console.log("Tokens buffer...", tokensBuffer);
 
             // Check if the buffer contains a period or question mark (end of sentence)
             const hasPeriod = tokensBuffer.includes(".");
@@ -409,57 +397,12 @@ const WebsocketConnection = async (websock: WebSocket.Server) => {
                 remainingText = parts.length > 1 ? parts[1] : "";
               }
 
-              // Send the complete sentence for TTS processing
-              if (clientData.cartesia_ws.readyState === WebSocket.OPEN) {
-                if (newContextId) {
-                  const ttsRequest = JSON.stringify({
-                    model_id: "sonic-2",
-                    transcript: completeSentence,
-                    voice: {
-                      mode: "id",
-                      id: "a0e99841-438c-4a64-b679-ae501e7d6091",
-                    },
-                    language: "en",
-                    context_id: newContextId,
-                    output_format: {
-                      container: "raw",
-                      encoding: "pcm_s16le",
-                      sample_rate: 44100,
-                    },
-                    continue: true,
-                  });
-
-                  console.log(ttsRequest);
-
-                  console.log("Sending TTS request to Cartesia");
-                  clientData.cartesia_ws.send(ttsRequest);
-                } else {
-                  newContextId = new Date().getTime().toString();
-                  const ttsRequest = JSON.stringify({
-                    model_id: "sonic-2",
-                    transcript: completeSentence,
-                    voice: {
-                      mode: "id",
-                      id: "a0e99841-438c-4a64-b679-ae501e7d6091",
-                    },
-                    language: "en",
-                    context_id: newContextId,
-                    output_format: {
-                      container: "raw",
-                      encoding: "pcm_s16le",
-                      sample_rate: 44100,
-                    },
-                    add_timestamps: true,
-                    continue: true,
-                  });
-
-                  console.log(ttsRequest);
-
-                  console.log("Sending TTS request to Cartesia");
-                  clientData.cartesia_ws.send(ttsRequest);
-                  clientData.cartesia_context_id = newContextId;
-                }
-              }
+              newContextId = sendToCartesiaTTS(
+                ws,
+                completeSentence,
+                newContextId,
+                true,
+              );
 
               // Update buffer to contain only text after the sentence terminator
               tokensBuffer = remainingText;
@@ -481,28 +424,12 @@ const WebsocketConnection = async (websock: WebSocket.Server) => {
             // Send completion event
             send(ws, "llm_complete", { fullText });
 
+            // sendToCartesiaTTS(ws, fullText);
+
             // If there's remaining text in the buffer, send it for TTS
             if (tokensBuffer.trim().length > 0) {
-              const ttsRequest = JSON.stringify({
-                model_id: "sonic-2",
-                transcript: tokensBuffer,
-                voice: {
-                  mode: "id",
-                  id: "a0e99841-438c-4a64-b679-ae501e7d6091",
-                },
-                language: "en",
-                context_id: newContextId,
-                output_format: {
-                  container: "raw",
-                  encoding: "pcm_s16le",
-                  sample_rate: 44100,
-                },
-                add_timestamps: true,
-                continue: !!newContextId,
-              });
-
-              console.log("Sending TTS request to Cartesia");
-              clientData.cartesia_ws.send(ttsRequest);
+              // Use our function for the final chunk as well
+              sendToCartesiaTTS(ws, tokensBuffer, newContextId, !!newContextId);
             }
           },
           onError: (error) => {
@@ -538,6 +465,64 @@ const WebsocketConnection = async (websock: WebSocket.Server) => {
 
     const resp = JSON.stringify(message);
     ws.send(resp);
+  };
+
+  /**
+   * Sends text to Cartesia TTS service for speech synthesis
+   * @param ws WebSocket client connection
+   * @param text Text to be spoken
+   * @param contextId Optional existing context ID for continuation
+   * @param continue_ Whether this is a continuation of previous speech
+   * @returns The context ID used for the request
+   */
+  const sendToCartesiaTTS = (
+    ws: WebSocket,
+    text: string,
+    contextId: string | null = null,
+    continue_ = false,
+  ): string => {
+    const clientData = clients.get(ws);
+    if (!clientData || !clientData.cartesia_ws) {
+      console.error("No valid Cartesia connection found");
+      return "";
+    }
+
+    // Generate a new context ID if none provided
+    const newContextId =
+      contextId ||
+      `tts-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
+
+    // Store the context ID in client data for tracking
+    clientData.cartesia_context_id = newContextId;
+
+    if (clientData.cartesia_ws.readyState === WebSocket.OPEN) {
+      const ttsRequest = JSON.stringify({
+        model_id: "sonic-2",
+        transcript: text,
+        voice: {
+          mode: "id",
+          id: "a0e99841-438c-4a64-b679-ae501e7d6091",
+        },
+        language: "en",
+        context_id: newContextId,
+        output_format: {
+          container: "raw",
+          encoding: "pcm_f32le",
+          sample_rate: 44100,
+        },
+        add_timestamps: true,
+        continue: continue_,
+      });
+
+      console.log(
+        `Sending TTS request to Cartesia with context ID: ${newContextId}`,
+      );
+      clientData.cartesia_ws.send(ttsRequest);
+    } else {
+      console.error("Cartesia WebSocket connection not open");
+    }
+
+    return newContextId;
   };
 };
 
